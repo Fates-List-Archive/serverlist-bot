@@ -220,7 +220,7 @@ enum SetField {
 
 #[derive(Eq, Serialize_repr, Deserialize_repr, PartialEq, Clone, Copy, Default)]
 #[repr(i32)]
-pub enum LongDescriptionType {
+enum LongDescriptionType {
     Html = 0,
     #[default]
     MarkdownServerSide = 1,
@@ -239,6 +239,20 @@ async fn set(
 
     if guild.is_none() {
         ctx.say("You must be in a server to use this command").await?;
+        return Ok(());
+    }
+
+    let member = ctx.author_member().await;
+
+    if member.is_none() {
+        ctx.say("You must be in a server to use this command").await?;
+        return Ok(());
+    }
+
+    let member = member.unwrap();
+
+    if !member.permissions(&ctx.discord())?.manage_guild() {
+        ctx.say("You must have ``Manage Server`` or ``Administrator`` permissions to use this command").await?;
         return Ok(());
     }
 
@@ -372,7 +386,7 @@ This is required to provide our users with the optimal experience and not tons o
             sqlx::query!(
                 "UPDATE servers SET invite_url = $1 WHERE guild_id = $2",
                 got_invite.code,
-                ctx.guild().unwrap().id.0 as i64
+                guild.id.0 as i64
             )
             .execute(&data.pool)
             .await?;
@@ -406,7 +420,7 @@ This is required to provide our users with the optimal experience and not tons o
             sqlx::query!(
                 "UPDATE servers SET invite_channel = $1 WHERE guild_id = $2",
                 value_i64,
-                ctx.guild().unwrap().id.0 as i64
+                guild.id.0 as i64
             )
             .execute(&data.pool)
             .await?;            
@@ -415,6 +429,21 @@ This is required to provide our users with the optimal experience and not tons o
             ctx.say("This command is being revamped right now and this option is not currently available!").await?;
         }
     }
+
+    // Audit log entry
+
+    sqlx::query!(
+        "INSERT INTO server_audit_logs (guild_id, user_id, username, user_guild_perms, field, value) VALUES ($1, $2, $3, $4, $5, $6)",
+        guild.id.0 as i64,
+        ctx.author().id.0 as i64,
+        ctx.author().name,
+        member.permissions(&ctx.discord()).unwrap().bits().to_string(),
+        format!("{:?}", field),
+        value
+    )
+    .execute(&data.pool)
+    .await?;
+
 
     ctx.say(format!("Set {:?} successfully. Either use /get or check out your server page!", field)).await?;
 
