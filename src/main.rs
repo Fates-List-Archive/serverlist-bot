@@ -15,6 +15,9 @@ use std::sync::Arc;
 use poise::serenity_prelude::Mentionable;
 use serde_repr::Deserialize_repr;
 use serde_repr::Serialize_repr;
+use std::borrow::Cow;
+use rand::{thread_rng, Rng};
+use rand::distributions::Alphanumeric;
 
 struct Data {pool: sqlx::PgPool, client: reqwest::Client, key_data: KeyData}
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -196,6 +199,83 @@ async fn disablevr(
     Ok(())
 }
 
+/// View audit logs.
+#[poise::command(prefix_command, track_edits, slash_command, guild_cooldown = 10, required_permissions = "SEND_MESSAGES")]
+async fn auditlogs(
+    ctx: Context<'_>,
+) -> Result<(), Error> {
+    let guild = ctx.guild();
+
+    if guild.is_none() {
+        ctx.say("You must be in a server to use this command").await?;
+        return Ok(());
+    }
+
+    let guild = guild.unwrap();
+
+    // Get around attachment limitation
+    ctx.defer().await?;
+
+    // Dump server table
+    let row = sqlx::query!(
+        "SELECT to_json(server_audit_logs) AS json FROM server_audit_logs WHERE guild_id = $1",
+        guild.id.0 as i64
+    )
+    .fetch_all(&ctx.data().pool)
+    .await?;
+
+    let logs = Vec::from_iter(row.iter().map(|row| row.json.as_ref().unwrap()));
+
+    let data = serde_json::to_string_pretty(&logs)?;
+
+    ctx.channel_id().send_message(&ctx.discord(), |m| {
+        m.content("JSON requested");
+        m.files(vec![serenity::AttachmentType::Bytes { data: Cow::from(data.as_bytes().to_vec()), filename: "audit-logs.json".to_string() }] )
+    }).await?;
+
+    ctx.say("Audit logs sent").await?;
+
+    Ok(())
+}
+
+/// Dumps the server data to a file for viewing.
+#[poise::command(prefix_command, track_edits, slash_command, guild_cooldown = 10, required_permissions = "ADMINISTRATOR")]
+async fn dumpserver(
+    ctx: Context<'_>,
+) -> Result<(), Error> {
+    let guild = ctx.guild();
+
+    if guild.is_none() {
+        ctx.say("You must be in a server to use this command").await?;
+        return Ok(());
+    }
+
+    let member = ctx.author_member().await.unwrap();
+
+    let guild = guild.unwrap();
+
+    // Dump server table
+    let row = sqlx::query!(
+        "SELECT to_json(servers) AS json FROM servers WHERE guild_id = $1",
+        guild.id.0 as i64
+    )
+    .fetch_one(&ctx.data().pool)
+    .await?;
+
+    let data = serde_json::to_string_pretty(&row.json.unwrap_or_else(|| serde_json::json!({})))?;
+
+    member.user.create_dm_channel(&ctx.discord()).await?.send_message(&ctx.discord(),|m| {
+        m.content("JSON requested");
+        m.files(vec![serenity::AttachmentType::Bytes { data: Cow::from(data.as_bytes().to_vec()), filename: "server-dump.json".to_string() }] )
+    }).await?;
+
+    ctx.say("DMed you server dump").await?;
+
+    Ok(())
+}
+
+
+
 #[derive(poise::ChoiceParameter, Debug)]
 enum SetField {
     #[name = "Description"] Description,
@@ -226,8 +306,16 @@ enum LongDescriptionType {
     MarkdownServerSide = 1,
 }
 
+fn create_token(length: usize) -> String {
+    thread_rng()
+    .sample_iter(&Alphanumeric)
+    .take(length)
+    .map(char::from)
+    .collect()
+}
+
 /// Sets a field
-#[poise::command(prefix_command, track_edits, slash_command)]
+#[poise::command(prefix_command, track_edits, slash_command, guild_cooldown = 5)]
 async fn set(
     ctx: Context<'_>,
     #[description = "Field to set"]
@@ -249,16 +337,30 @@ async fn set(
         return Ok(());
     }
 
+    let guild = guild.unwrap();    
+
+    let data = ctx.data();
+
+    // Update server details
+    sqlx::query!(
+        "INSERT INTO servers (guild_id, owner_id, name_cached, avatar_cached, api_token) VALUES ($1, $2, $3, $4, $5) 
+        ON CONFLICT (guild_id) DO UPDATE SET owner_id = excluded.owner_id, name_cached = excluded.name_cached, 
+        avatar_cached = excluded.avatar_cached WHERE servers.guild_id = $1",
+        guild.id.0 as i64,
+        ctx.author().id.0 as i64,
+        guild.name.to_string(),
+        guild.icon_url().unwrap_or_else(|| "https://api.fateslist.xyz/static/botlisticon.webp".to_string()),
+        create_token(128)
+    )
+    .execute(&data.pool)
+    .await?;
+
     let member = member.unwrap();
 
     if !member.permissions(&ctx.discord())?.manage_guild() {
         ctx.say("You must have ``Manage Server`` or ``Administrator`` permissions to use this command").await?;
         return Ok(());
     }
-
-    let guild = guild.unwrap();
-
-    let data = ctx.data();
 
     let mut value = value; // Force it to be mutable and shadow immutable value
 
@@ -445,7 +547,7 @@ This is required to provide our users with the optimal experience and not tons o
     .await?;
 
 
-    ctx.say(format!("Set {:?} successfully. Either use /get or check out your server page!", field)).await?;
+    ctx.say(format!("Set {:?} successfully. Either use /dumpserver or check out your server page!", field)).await?;
 
     Ok(())
 }
@@ -756,7 +858,7 @@ async fn vote_reminder_task(pool: sqlx::PgPool, key_data: KeyData, http: Arc<ser
                     mod_front = ", ";
                 }
 
-                servers_str += format!("the server {mod_front} ({server})", server = server, mod_front = mod_front).as_str();
+                servers_str += format!("the server {mod_front} {server}", server = server, mod_front = mod_front).as_str();
 
                 tlen -= 1;
             }
@@ -846,7 +948,7 @@ async fn main() {
             listener: |ctx, event, framework, user_data| { 
                 Box::pin(event_listener(ctx, event, framework, user_data))
             },
-            commands: vec![accage(), vote(), help(), register(), about(), disablevr(), set()],
+            commands: vec![accage(), vote(), help(), register(), about(), disablevr(), set(), dumpserver(), auditlogs()],
             ..poise::FrameworkOptions::default()
         })
         .run().await;
