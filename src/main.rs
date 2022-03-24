@@ -19,6 +19,8 @@ use std::borrow::Cow;
 use rand::{thread_rng, Rng};
 use rand::distributions::Alphanumeric;
 
+mod helpers;
+
 struct Data {pool: sqlx::PgPool, client: reqwest::Client, key_data: KeyData}
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
@@ -687,11 +689,11 @@ enum SetField {
     #[name = "Long Description Type"] LongDescriptionType,
     #[name = "Invite Code"] InviteCode,
     #[name = "Invite Channel ID"] InviteChannelID, 
-    #[name = "Website"] Website, // Done till here
-    #[name = "CSS"] Css,
+    #[name = "Website"] Website, 
+    #[name = "CSS"] Css, 
     #[name = "Banner (server card)"] BannerCard,
-    #[name = "Banner (server page)"] BannerPage,
-    #[name = "Keep Banner Decorations"] KeepBannerDecor,
+    #[name = "Banner (server page)"] BannerPage, 
+    #[name = "Keep Banner Decorations"] KeepBannerDecor, // Done till here
     #[name = "Vanity"] Vanity,
     #[name = "Webhook URL"] WebhookURL,
     #[name = "Webhook Secret"] WebhookSecret,
@@ -719,12 +721,12 @@ fn create_token(length: usize) -> String {
 }
 
 /// Sets a field
-#[poise::command(prefix_command, track_edits, slash_command, guild_cooldown = 5)]
+#[poise::command(prefix_command, track_edits, slash_command, guild_cooldown = 5, required_permissions = "MANAGE_GUILD")]
 async fn set(
     ctx: Context<'_>,
     #[description = "Field to set"]
     field: SetField,
-    #[description = "(Raw) Value to set field to"]
+    #[description = "(Raw) Value to set field to. 'none' to reset"]
     value: String,
 ) -> Result<(), Error> {
     let guild = ctx.guild();
@@ -741,32 +743,32 @@ async fn set(
         return Ok(());
     }
 
+    let mut value = value; // Force it to be mutable and shadow immutable value
+
+    if value == "none".to_string() {
+        value = "".to_string();
+    }
+
     let guild = guild.unwrap();    
 
     let data = ctx.data();
 
     // Update server details
     sqlx::query!(
-        "INSERT INTO servers (guild_id, owner_id, name_cached, avatar_cached, api_token) VALUES ($1, $2, $3, $4, $5) 
+        "INSERT INTO servers (guild_id, owner_id, name_cached, avatar_cached, api_token, guild_count) VALUES ($1, $2, $3, $4, $5, $6) 
         ON CONFLICT (guild_id) DO UPDATE SET owner_id = excluded.owner_id, name_cached = excluded.name_cached, 
-        avatar_cached = excluded.avatar_cached WHERE servers.guild_id = $1",
+        avatar_cached = excluded.avatar_cached, guild_count = excluded.guild_count WHERE servers.guild_id = $1",
         guild.id.0 as i64,
         ctx.author().id.0 as i64,
         guild.name.to_string(),
         guild.icon_url().unwrap_or_else(|| "https://api.fateslist.xyz/static/botlisticon.webp".to_string()),
-        create_token(128)
+        create_token(128),
+        guild.member_count as i64
     )
     .execute(&data.pool)
     .await?;
 
     let member = member.unwrap();
-
-    if !member.permissions(&ctx.discord())?.manage_guild() {
-        ctx.say("You must have ``Manage Server`` or ``Administrator`` permissions to use this command").await?;
-        return Ok(());
-    }
-
-    let mut value = value; // Force it to be mutable and shadow immutable value
 
     // Force HTTP(s)
     value = value.replace("http://", "https://");
@@ -934,7 +936,7 @@ This is required to provide our users with the optimal experience and not tons o
             .await?;            
         },
         SetField::Website => {
-            if !value.starts_with("https://") {
+            if !value.starts_with("https://") && value != "".to_string() {
                 ctx.say("Website must start with https://").await?;
                 return Ok(());
             }
@@ -942,6 +944,57 @@ This is required to provide our users with the optimal experience and not tons o
             sqlx::query!(
                 "UPDATE servers SET website = $1 WHERE guild_id = $2",
                 value,
+                ctx.guild().unwrap().id.0 as i64
+            )
+            .execute(&data.pool)
+            .await?;
+        },
+        SetField::Css => {
+            sqlx::query!(
+                "UPDATE servers SET css = $1 WHERE guild_id = $2",
+                value,
+                ctx.guild().unwrap().id.0 as i64
+            )
+            .execute(&data.pool)
+            .await?;
+        },
+        SetField::BannerCard => {
+            ctx.defer().await?;
+            helpers::check_banner_img(&data.client, &value).await?;
+
+            sqlx::query!(
+                "UPDATE servers SET banner_card = $1 WHERE guild_id = $2",
+                value,
+                ctx.guild().unwrap().id.0 as i64
+            )
+            .execute(&data.pool)
+            .await?;
+        },
+        SetField::BannerPage => {
+            ctx.defer().await?;
+            helpers::check_banner_img(&data.client, &value).await?;
+
+            sqlx::query!(
+                "UPDATE servers SET banner_page = $1 WHERE guild_id = $2",
+                value,
+                ctx.guild().unwrap().id.0 as i64
+            )
+            .execute(&data.pool)
+            .await?;
+        },
+        SetField::KeepBannerDecor => {
+            let keep_banner_decor = match value.as_str() {
+                "true" | "0" => true,
+                "false" | "1" => false,
+                _ => {
+                    ctx.say("keep_banner_decor must be either `false` (`0`) or `true` (`1`)").await?;
+                    return Ok(());
+                }
+            };
+
+            sqlx::query!(
+                "UPDATE servers SET keep_banner_decor = $1 WHERE guild_id = $2",
+                keep_banner_decor,
                 ctx.guild().unwrap().id.0 as i64
             )
             .execute(&data.pool)
@@ -1021,12 +1074,6 @@ async fn register(ctx: Context<'_>, #[flag] global: bool) -> Result<(), Error> {
     Ok(())
 }
 
-// Internal Secrets Struct
-#[derive(Deserialize)]
-pub struct Secrets {
-    pub token_server: String,
-}
-
 #[derive(Deserialize, Clone)]
 pub struct KeyChannels {
     vote_reminder_channel: serenity::model::id::ChannelId,
@@ -1050,19 +1097,6 @@ fn get_data_dir() -> String {
     data_dir
 }
 
-fn get_bot_token() -> String {
-    let data_dir = get_data_dir();
-
-    // open secrets.json, handle config
-    let mut file = File::open(data_dir + "secrets.json").expect("No config file found");
-    let mut data = String::new();
-    file.read_to_string(&mut data).unwrap();
-
-    let secrets: Secrets = serde_json::from_str(&data).expect("JSON was not well-formatted");
-
-    secrets.token_server
-}
-
 fn get_key_data() -> KeyData {
     let data_dir = get_data_dir();
 
@@ -1074,6 +1108,24 @@ fn get_key_data() -> KeyData {
     let data: KeyData = serde_json::from_str(&data).expect("Discord JSON was not well-formatted");
 
     data
+}
+
+#[derive(Deserialize)]
+struct Secrets {
+    token_server: String
+}
+
+fn get_bot_token() -> String {
+    let data_dir = get_data_dir();
+
+    // open secrets.json, handle config
+    let mut file = File::open(data_dir + "secrets.json").expect("No config file found");
+    let mut data = String::new();
+    file.read_to_string(&mut data).unwrap();
+
+    let secrets: Secrets = serde_json::from_str(&data).expect("JSON was not well-formatted");
+
+    secrets.token_server
 }
 
 async fn on_error(error: poise::FrameworkError<'_, Data, Error>) {
