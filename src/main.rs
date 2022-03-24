@@ -199,8 +199,414 @@ async fn disablevr(
     Ok(())
 }
 
+/// Tag base command
+#[poise::command(prefix_command, slash_command, guild_cooldown = 10, required_permissions = "SEND_MESSAGES")]
+async fn tags(
+    ctx: Context<'_>,
+) -> Result<(), Error> {
+    ctx.say("Available options are ``tags add``, ``tags dump``, ``tags remove``, ``tags edit``, ``tags nuke`` and ``tags transfer``.").await?;
+    Ok(())
+}
+
+/// Adds a tag
+#[poise::command(prefix_command, slash_command, guild_cooldown = 10, required_permissions = "MANAGE_GUILD", rename = "add")]
+async fn tag_add(
+    ctx: Context<'_>,
+    #[description = "Tag name"]
+    tag_name: String
+) -> Result<(), Error> {
+    let data = ctx.data();
+
+    let guild = ctx.guild();
+
+    if guild.is_none() {
+        ctx.say("You must be in a server to use this command").await?;
+        return Ok(());
+    }
+
+    let guild = guild.unwrap();
+
+    let sanitized = tag_name.chars().filter(|&c| c.is_alphabetic() || c == ' ').collect::<String>();
+
+    if sanitized != tag_name {
+        ctx.say("Tag name contains invalid characters. Only a-z and spaces are allowed.").await?;
+        return Ok(());
+    }
+
+    let banned = vec!["best-", "good-", "fuck", "nigger", "fates-list", "fateslist"];
+
+    for kw in banned {
+        if tag_name.contains(kw) {
+            ctx.say(&format!("{} not allowed in tag names", kw)).await?;
+            return Ok(())
+        }
+    }
+
+    let internal_tag_name = tag_name.replace(' ', "-").to_lowercase();
+
+    let check = sqlx::query!(
+        "SELECT owner_guild FROM server_tags WHERE id = $1",
+        internal_tag_name
+    )
+    .fetch_one(&data.pool)
+    .await;
+
+    match check {
+        Err(sqlx::Error::RowNotFound) => {
+            sqlx::query!(
+                "INSERT INTO server_tags (id, name, iconify_data, owner_guild) VALUES ($1, $2, $3, $4)",
+                internal_tag_name,
+                tag_name,
+                "fluent:animal-cat-28-regular",
+                guild.id.0 as i64,
+            )
+            .execute(&data.pool)
+            .await?;
+
+            // Then just update tags array
+            sqlx::query!(
+                "UPDATE servers SET tags = array_append(tags, $1) WHERE guild_id = $2",
+                internal_tag_name,
+                guild.id.0 as i64
+            )
+            .execute(&data.pool)
+            .await?;
+
+            ctx.say(format!("Tag {} added and ownership claimed as this is a brand new tag!", tag_name)).await?;
+        },
+        Err(e) => {
+            ctx.say(format!("Error: {}", e)).await?;
+        },
+        Ok(row) => {
+            // Check if tag already exists
+            let check = sqlx::query!(
+                "SELECT tags FROM servers WHERE guild_id = $1",
+                guild.id.0 as i64
+            )
+            .fetch_one(&data.pool)
+            .await?;
+
+            for tag in check.tags.unwrap_or_default() {
+                if tag == internal_tag_name {
+                    ctx.say(format!("Tag {} is already present on this server!", tag_name)).await?;
+                    return Ok(());
+                }
+            }
+
+            // Then just update tags array
+            sqlx::query!(
+                "UPDATE servers SET tags = array_append(tags, $1) WHERE guild_id = $2",
+                internal_tag_name,
+                guild.id.0 as i64
+            )
+            .execute(&data.pool)
+            .await?;
+
+            let mut owner_guild = row.owner_guild;
+
+            if owner_guild == 0 {
+                // We have a unclaimed tag, claim it
+                sqlx::query!(
+                    "UPDATE server_tags SET owner_guild = $1 WHERE id = $2",
+                    guild.id.0 as i64,
+                    internal_tag_name
+                )
+                .execute(&data.pool)
+                .await?;
+                owner_guild = guild.id.0 as i64;
+            }
+
+            ctx.say(format!("Tag {} added. The current owner server of this tag is {}. You can get detailed tag information using ``tag dump``!", tag_name, owner_guild)).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Edits a tag
+#[poise::command(prefix_command, slash_command, guild_cooldown = 10, required_permissions = "MANAGE_GUILD", rename = "edit")]
+async fn tag_edit(
+    ctx: Context<'_>,
+    #[description = "Tag name"]
+    tag_name: String,
+    #[description = "New iconify icon (see https://iconify.design)"]
+    iconify_data: String
+) -> Result<(), Error> {
+
+    let data = ctx.data();
+
+    let guild = ctx.guild();
+
+    if guild.is_none() {
+        ctx.say("You must be in a server to use this command").await?;
+        return Ok(());
+    }
+
+    let guild = guild.unwrap();
+
+    let internal_tag_name = tag_name.replace(' ', "-").to_lowercase();
+
+    let check = sqlx::query!(
+        "SELECT owner_guild FROM server_tags WHERE id = $1",
+        internal_tag_name
+    )
+    .fetch_one(&data.pool)
+    .await;
+
+    match check {
+        Err(sqlx::Error::RowNotFound) => {
+            ctx.say(format!("Tag {} not found", tag_name)).await?;
+        },
+        Err(e) => {
+            ctx.say(format!("Error: {}", e)).await?;
+        },
+        Ok(row) => {
+            if row.owner_guild != guild.id.0 as i64 {
+                ctx.say(format!("You do not own tag {} and as such you may not modify its properties.\n\nContact Fates List Staff if you think this server is holding the tag for malicious purposes and does not allow for sane discussion over it.", tag_name)).await?;
+                return Ok(());
+            }
+
+            sqlx::query!(
+                "UPDATE server_tags SET iconify_data = $1 WHERE id = $2",
+                iconify_data,
+                internal_tag_name
+            )
+            .execute(&data.pool)
+            .await?;
+
+            ctx.say(format!("Tag {} updated!", tag_name)).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Nukes a tag if it is only present in one or less servers
+#[poise::command(prefix_command, slash_command, guild_cooldown = 10, required_permissions = "MANAGE_GUILD", rename = "nuke")]
+async fn tag_nuke(
+    ctx: Context<'_>,
+    #[description = "Tag name"]
+    tag_name: String,
+) -> Result<(), Error> {
+
+    let data = ctx.data();
+
+    let internal_tag_name = tag_name.replace(' ', "-").to_lowercase();
+
+    let check = sqlx::query!(
+        "SELECT guild_id FROM servers WHERE tags && $1",
+        &vec![internal_tag_name.clone()]
+    )
+    .fetch_all(&data.pool)
+    .await?;
+
+    if check.len() > 1 {
+        ctx.say(format!("Tag {} is present on more than one server and cannot be nuked: {:?}.", tag_name, check)).await?;
+        return Ok(());
+    }
+
+    sqlx::query!(
+        "DELETE FROM server_tags WHERE id = $1",
+        internal_tag_name
+    )
+    .execute(&data.pool)
+    .await?;
+
+    sqlx::query!(
+        "UPDATE servers SET tags = array_remove(tags, $1)",
+        internal_tag_name
+    )
+    .execute(&data.pool)
+    .await?;
+
+    ctx.say("Tag nuked!").await?;
+
+    Ok(())
+}
+
+/// Transfers a tag
+#[poise::command(prefix_command, slash_command, guild_cooldown = 10, required_permissions = "MANAGE_GUILD", rename = "transfer")]
+async fn tag_transfer(
+    ctx: Context<'_>,
+    #[description = "Tag name"]
+    tag_name: String,
+    #[description = "New server. Set to 'unclaim' to unclaim the tag. A unclaimed tag may be claimed by adding it."]
+    new_server: String
+) -> Result<(), Error> {
+
+    let data = ctx.data();
+
+    let guild = ctx.guild();
+
+    if guild.is_none() {
+        ctx.say("You must be in a server to use this command").await?;
+        return Ok(());
+    }
+
+    let guild = guild.unwrap();
+
+    let internal_tag_name = tag_name.replace(' ', "-").to_lowercase();
+
+    let check = sqlx::query!(
+        "SELECT owner_guild FROM server_tags WHERE id = $1",
+        internal_tag_name
+    )
+    .fetch_one(&data.pool)
+    .await;
+
+    match check {
+        Err(sqlx::Error::RowNotFound) => {
+            ctx.say(format!("Tag {} not found", tag_name)).await?;
+        },
+        Err(e) => {
+            ctx.say(format!("Error: {}", e)).await?;
+        },
+        Ok(row) => {
+            if row.owner_guild != guild.id.0 as i64 {
+                ctx.say(format!("You do not own tag {} and as such you may not modify its properties.\n\nContact Fates List Staff if you think this server is holding the tag for malicious purposes and does not allow for sane discussion over it.", tag_name)).await?;
+                return Ok(());
+            }
+
+            if new_server == "unclaim" {
+                // Remove tag claim
+                sqlx::query!(
+                    "UPDATE server_tags SET owner_guild = $1 WHERE id = $2",
+                    0,
+                    internal_tag_name
+                )
+                .execute(&data.pool)
+                .await?;
+
+                ctx.say(format!("Tag {} unclaimed!", tag_name)).await?;
+
+                return Ok(())
+            }
+
+            let new_server_id = match new_server.parse::<i64>() {
+                Ok(id) => id,
+                Err(_) => {
+                    ctx.say(format!("Server {} is not a i64", new_server)).await?;
+                    return Ok(());
+                }
+            };
+
+            let check = sqlx::query!(
+                "SELECT tags FROM servers WHERE guild_id = $1",
+                new_server_id
+            )
+            .fetch_one(&data.pool)
+            .await?;
+
+            for tag in check.tags.unwrap_or_default() {
+                if tag == internal_tag_name {
+                    sqlx::query!(
+                        "UPDATE server_tags SET owner_guild = $1 WHERE id = $2",
+                        new_server_id,
+                        internal_tag_name
+                    )
+                    .execute(&data.pool)
+                    .await?;
+
+                    ctx.say(format!("Tag {} transferred!", tag_name)).await?;
+                    return Ok(());
+                }
+            }
+            ctx.say(format!("Tag {} could not be transferred as recipient server does not also have tag!", tag_name)).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Dumps a tag
+#[poise::command(prefix_command, slash_command, guild_cooldown = 10, required_permissions = "SEND_MESSAGES", rename = "dump")]
+async fn tag_dump(
+    ctx: Context<'_>,
+    #[description = "Tag name or internal name"]
+    tag_name: String
+) -> Result<(), Error> {
+    let data = ctx.data();
+
+    // Dump tag table
+    let row = sqlx::query!(
+        "SELECT to_json(server_tags) AS json FROM server_tags WHERE id = $1 OR name = $1",
+        tag_name
+    )
+    .fetch_one(&data.pool)
+    .await?;
+
+    let data = serde_json::to_string_pretty(&row.json)?;
+
+    // Get around attachment limitation
+    ctx.defer().await?;
+
+    ctx.send(|m| {
+        m.content("Tag dump");
+        m.attachment(serenity::AttachmentType::Bytes { data: Cow::from(data.as_bytes().to_vec()), filename: "tag-dump.json".to_string() } )
+    }).await?;
+
+    Ok(())
+}
+
+/// Removes a tag from a server.
+#[poise::command(prefix_command, slash_command, guild_cooldown = 10, required_permissions = "MANAGE_GUILD", rename = "remove")]
+async fn tag_remove(
+    ctx: Context<'_>,
+    #[description = "Tag name"]
+    tag_name: String
+) -> Result<(), Error> {
+    let data = ctx.data();
+
+    let guild = ctx.guild();
+
+    if guild.is_none() {
+        ctx.say("You must be in a server to use this command").await?;
+        return Ok(());
+    }
+
+    let guild = guild.unwrap();
+
+    let internal_tag_name = tag_name.replace(' ', "-").to_lowercase();
+
+    let check = sqlx::query!(
+        "SELECT owner_guild FROM server_tags WHERE id = $1",
+        internal_tag_name
+    )
+    .fetch_one(&data.pool)
+    .await;
+
+    match check {
+        Err(sqlx::Error::RowNotFound) => {
+            ctx.say(format!("Tag {} not found", tag_name)).await?;
+        },
+        Err(e) => {
+            ctx.say(format!("Error: {}", e)).await?;
+        },
+        Ok(row) => {
+            if row.owner_guild == guild.id.0 as i64 {
+                ctx.say(format!("You currently own tag {} and as such cannot remove it. Consider transferring it to another server using ``tag transfer``. See ``help`` for more information.", tag_name)).await?;
+                return Ok(());
+            }
+
+            // Then just update tags array
+            sqlx::query!(
+                "UPDATE servers SET tags = array_remove(tags, $1) WHERE guild_id = $2",
+                internal_tag_name,
+                guild.id.0 as i64
+            )
+            .execute(&data.pool)
+            .await?;
+
+            ctx.say(format!("Tag {} removed if present. You can use ``dumpserver`` to verify this", tag_name)).await?;
+        }
+    }
+
+    Ok(())
+}
+
+
 /// View audit logs.
-#[poise::command(prefix_command, track_edits, slash_command, guild_cooldown = 10, required_permissions = "SEND_MESSAGES")]
+#[poise::command(prefix_command, slash_command, guild_cooldown = 10, required_permissions = "SEND_MESSAGES")]
 async fn auditlogs(
     ctx: Context<'_>,
 ) -> Result<(), Error> {
@@ -228,12 +634,10 @@ async fn auditlogs(
 
     let data = serde_json::to_string_pretty(&logs)?;
 
-    ctx.channel_id().send_message(&ctx.discord(), |m| {
-        m.content("JSON requested");
-        m.files(vec![serenity::AttachmentType::Bytes { data: Cow::from(data.as_bytes().to_vec()), filename: "audit-logs.json".to_string() }] )
+    ctx.send(|m| {
+        m.content("Audit Logs");
+        m.attachment(serenity::AttachmentType::Bytes { data: Cow::from(data.as_bytes().to_vec()), filename: "audit-logs.json".to_string() } )
     }).await?;
-
-    ctx.say("Audit logs sent").await?;
 
     Ok(())
 }
@@ -282,8 +686,8 @@ enum SetField {
     #[name = "Long Description"] LongDescription,
     #[name = "Long Description Type"] LongDescriptionType,
     #[name = "Invite Code"] InviteCode,
-    #[name = "Invite Channel ID"] InviteChannelID,
-    #[name = "Website"] Website,
+    #[name = "Invite Channel ID"] InviteChannelID, 
+    #[name = "Website"] Website, // Done till here
     #[name = "CSS"] Css,
     #[name = "Banner (server card)"] BannerCard,
     #[name = "Banner (server page)"] BannerPage,
@@ -495,6 +899,8 @@ This is required to provide our users with the optimal experience and not tons o
         },
         SetField::InviteChannelID => {
             // Check for CREATE_INVITES
+            let value: String = value.chars().filter(|c| c.is_digit(10)).collect();
+
             let value_i64 = value.parse::<i64>()?;
 
             let bot = ctx.discord().cache.current_user();
@@ -526,7 +932,21 @@ This is required to provide our users with the optimal experience and not tons o
             )
             .execute(&data.pool)
             .await?;            
-        }
+        },
+        SetField::Website => {
+            if !value.starts_with("https://") {
+                ctx.say("Website must start with https://").await?;
+                return Ok(());
+            }
+
+            sqlx::query!(
+                "UPDATE servers SET website = $1 WHERE guild_id = $2",
+                value,
+                ctx.guild().unwrap().id.0 as i64
+            )
+            .execute(&data.pool)
+            .await?;
+        },
         _ => {
             ctx.say("This command is being revamped right now and this option is not currently available!").await?;
         }
@@ -926,6 +1346,10 @@ async fn main() {
                 client,
             })
         }))
+        .client_settings(|c| {
+            // This is *for now*
+            c.intents(serenity::GatewayIntents::GUILDS | serenity::GatewayIntents::MESSAGE_CONTENT | serenity::GatewayIntents::GUILD_MESSAGES | serenity::GatewayIntents::DIRECT_MESSAGES | serenity::GatewayIntents::GUILD_MEMBERS | serenity::GatewayIntents::GUILD_PRESENCES)
+        })
         .options(poise::FrameworkOptions {
             // configure framework here
             prefix_options: poise::PrefixFrameworkOptions {
@@ -948,7 +1372,28 @@ async fn main() {
             listener: |ctx, event, framework, user_data| { 
                 Box::pin(event_listener(ctx, event, framework, user_data))
             },
-            commands: vec![accage(), vote(), help(), register(), about(), disablevr(), set(), dumpserver(), auditlogs()],
+            commands: vec![
+                accage(), 
+                vote(), 
+                help(), 
+                register(), 
+                about(), 
+                disablevr(), 
+                set(), 
+                dumpserver(), 
+                auditlogs(),
+                poise::Command {
+                    subcommands: vec![
+                        tag_add(),
+                        tag_edit(),
+                        tag_remove(),
+                        tag_transfer(),
+                        tag_nuke(),
+                        tag_dump()
+                    ],
+                    ..tags()
+                }
+            ],
             ..poise::FrameworkOptions::default()
         })
         .run().await;
