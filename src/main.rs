@@ -733,9 +733,9 @@ enum SetField {
     #[name = "Webhook URL"] WebhookURL, 
     #[name = "Webhook Secret"] WebhookSecret, 
     #[name = "Webhook HMAC Only"] WebhookHMACOnly,
-    #[name = "Requires Login To Join"] RequiresLogin, // Done till here
-    #[name = "Vote Roles"] VoteRoles,
-    #[name = "Whitelist Only"] WhitlistOnly,
+    #[name = "Requires Login To Join"] RequiresLogin, 
+    #[name = "Vote Roles"] VoteRoles, 
+    #[name = "Whitelist Only"] WhitelistOnly, // Done till here
     #[name = "Whitelist Form"] WhitelistForm,
 }
 
@@ -1165,9 +1165,38 @@ async fn set(
             .execute(&data.pool)
             .await?;
         },
-        _ => {
-            ctx.say("This command is being revamped right now and this option is not currently available!").await?;
-        }
+        SetField::WhitelistOnly => {
+            let whitelist_only = match value.as_str() {
+                "true" | "0" => true,
+                "false" | "1" => false,
+                _ => {
+                    ctx.say("whitelist_only must be either `false` (`0`) or `true` (`1`)").await?;
+                    return Ok(());
+                }
+            };
+
+            sqlx::query!(
+                "UPDATE servers SET whitelist_only = $1 WHERE guild_id = $2",
+                whitelist_only,
+                ctx.guild().unwrap().id.0 as i64
+            )
+            .execute(&data.pool)
+            .await?;
+        },
+        SetField::WhitelistForm => {
+            if !value.starts_with("https://") && value != *"" {
+                ctx.say("Whitelist Form must start with https://").await?;
+                return Ok(());
+            }
+
+            sqlx::query!(
+                "UPDATE servers SET whitelist_form = $1 WHERE guild_id = $2",
+                value,
+                ctx.guild().unwrap().id.0 as i64
+            )
+            .execute(&data.pool)
+            .await?;
+        },
     }
 
     // Audit log entry
