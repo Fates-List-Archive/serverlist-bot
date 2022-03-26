@@ -277,7 +277,7 @@ async fn tag_add(
             ctx.say(format!("Tag {} added and ownership claimed as this is a brand new tag!", tag_name)).await?;
         },
         Err(e) => {
-            ctx.say(format!("Error: {}", e)).await?;
+            return Err(Box::new(e));
         },
         Ok(row) => {
             // Check if tag already exists
@@ -360,7 +360,7 @@ async fn tag_edit(
             ctx.say(format!("Tag {} not found", tag_name)).await?;
         },
         Err(e) => {
-            ctx.say(format!("Error: {}", e)).await?;
+            return Err(Box::new(e));
         },
         Ok(row) => {
             if row.owner_guild != guild.id.0 as i64 {
@@ -461,7 +461,7 @@ async fn tag_transfer(
             ctx.say(format!("Tag {} not found", tag_name)).await?;
         },
         Err(e) => {
-            ctx.say(format!("Error: {}", e)).await?;
+            return Err(Box::new(e));
         },
         Ok(row) => {
             if row.owner_guild != guild.id.0 as i64 {
@@ -582,7 +582,7 @@ async fn tag_remove(
             ctx.say(format!("Tag {} not found", tag_name)).await?;
         },
         Err(e) => {
-            ctx.say(format!("Error: {}", e)).await?;
+            return Err(Box::new(e));
         },
         Ok(row) => {
             if row.owner_guild == guild.id.0 as i64 {
@@ -668,14 +668,49 @@ async fn dumpserver(
     .fetch_one(&ctx.data().pool)
     .await?;
 
-    let data = serde_json::to_string_pretty(&row.json.unwrap_or_else(|| serde_json::json!({})))?;
+    let vanity = sqlx::query!(
+        "SELECT to_json(vanity) AS json FROM vanity WHERE redirect = $1",
+        guild.id.0 as i64
+    )
+    .fetch_one(&ctx.data().pool)
+    .await;
 
-    member.user.create_dm_channel(&ctx.discord()).await?.send_message(&ctx.discord(),|m| {
-        m.content("JSON requested");
-        m.files(vec![serenity::AttachmentType::Bytes { data: Cow::from(data.as_bytes().to_vec()), filename: "server-dump.json".to_string() }] )
-    }).await?;
+    let vanity_data = match vanity {
+        Ok(vanity) => {
+            vanity.json.unwrap_or_else(|| serde_json::json!({}))
+        }
+        Err(sqlx::Error::RowNotFound) => {
+            serde_json::json!({})
+        }
+        Err(e) => {
+            return Err(Box::new(e));
+        }
+    };
 
-    ctx.say("DMed you server dump").await?;
+    let row_json = row.json.unwrap_or_else(|| serde_json::json!({}));
+
+    if let serde_json::Value::Object(mut v) = row_json {
+        v.insert("vanity".to_string(), vanity_data);
+
+        // Remove sensitive fields
+        v.remove("webhook_secret");
+        v.insert("webhook_secret".to_string(), serde_json::json!("Redacted from server dump. Reset using /set"));
+
+        let data = serde_json::to_string_pretty(&v)?;
+
+        member.user.create_dm_channel(&ctx.discord()).await?.send_message(&ctx.discord(),|m| {
+            m.content("**Server Dump**");
+            m.files(vec![
+                serenity::AttachmentType::Bytes { data: Cow::from(data.as_bytes().to_vec()), filename: "server.json".to_string() },
+            ] )
+        }).await?;
+
+        ctx.say("DMed you server dump").await?;
+
+        return Ok(());
+    } 
+
+    ctx.say("Failed to dump server. Contact Fates List Support.").await?;
 
     Ok(())
 }
@@ -693,12 +728,12 @@ enum SetField {
     #[name = "CSS"] Css, 
     #[name = "Banner (server card)"] BannerCard,
     #[name = "Banner (server page)"] BannerPage, 
-    #[name = "Keep Banner Decorations"] KeepBannerDecor, // Done till here
-    #[name = "Vanity"] Vanity,
-    #[name = "Webhook URL"] WebhookURL,
-    #[name = "Webhook Secret"] WebhookSecret,
+    #[name = "Keep Banner Decorations"] KeepBannerDecor, 
+    #[name = "Vanity"] Vanity, 
+    #[name = "Webhook URL"] WebhookURL, 
+    #[name = "Webhook Secret"] WebhookSecret, 
     #[name = "Webhook HMAC Only"] WebhookHMACOnly,
-    #[name = "Requires Login To Join"] RequiresLogin,
+    #[name = "Requires Login To Join"] RequiresLogin, // Done till here
     #[name = "Vote Roles"] VoteRoles,
     #[name = "Whitelist Only"] WhitlistOnly,
     #[name = "Whitelist Form"] WhitelistForm,
@@ -745,7 +780,7 @@ async fn set(
 
     let mut value = value; // Force it to be mutable and shadow immutable value
 
-    if value == "none".to_string() {
+    if value == *"none" {
         value = "".to_string();
     }
 
@@ -838,66 +873,77 @@ async fn set(
             .await?;
         },
         SetField::InviteCode => {
-            // Check for MANAGE_GUILD
-            let bot = ctx.discord().cache.current_user();
-            let bot_member = guild.member(&ctx.discord(), bot.id).await?;
-            if !bot_member.permissions(&ctx.discord())?.manage_guild() {
-                ctx.say("The bot must have the `Manage Server` permission to change invite codes.
-This is due to a dumb discord API decision to lock some *basic* invite information behind Manage Server
-                
-It is strongly recommended to remove this permission **immediately** after setting invite code for security purposes"
-            ).await?;
-                return Ok(());
-            }
-
-            // Validate invite code
-            let guild_invites = guild.invites(&ctx.discord()).await?;
-
-            value = value.replace("https://discord.gg/", "").replace("https://discord.com/invite/", "");
-
-            let mut got_invite: Option<serenity::RichInvite> = None;
-            for invite in guild_invites {
-                if invite.code == value {
-                    got_invite = Some(invite);
-                    break;
+            if value == *"" {
+                let none: Option<String> = None;
+                sqlx::query!(
+                    "UPDATE servers SET invite_url = $1 WHERE guild_id = $2",
+                    none,
+                    guild.id.0 as i64
+                )
+                .execute(&data.pool)
+                .await?;    
+            } else {
+                // Check for MANAGE_GUILD
+                let bot = ctx.discord().cache.current_user();
+                let bot_member = guild.member(&ctx.discord(), bot.id).await?;
+                if !bot_member.permissions(&ctx.discord())?.manage_guild() {
+                    ctx.say("The bot must have the `Manage Server` permission to change invite codes.
+    This is due to a dumb discord API decision to lock some *basic* invite information behind Manage Server
+                    
+    It is strongly recommended to remove this permission **immediately** after setting invite code for security purposes"
+                ).await?;
+                    return Ok(());
                 }
+
+                // Validate invite code
+                let guild_invites = guild.invites(&ctx.discord()).await?;
+
+                value = value.replace("https://discord.gg/", "").replace("https://discord.com/invite/", "");
+
+                let mut got_invite: Option<serenity::RichInvite> = None;
+                for invite in guild_invites {
+                    if invite.code == value {
+                        got_invite = Some(invite);
+                        break;
+                    }
+                }
+
+                if got_invite.is_none() {
+                    ctx.say("Invite code could not be found on this guild").await?;
+                    return Ok(());
+                }
+
+                let got_invite = got_invite.unwrap();
+
+                if got_invite.max_age != 0 {
+                    ctx.say("Invite code must be permanent/unlimited time. 
+                    
+    This is required to provide our users with the optimal experience and not tons of broken links.").await?;
+                    return Ok(());
+                }
+
+                if got_invite.max_uses != 0 {
+                    ctx.say("Invite code must be unlimited use. 
+                    
+    This is required to provide our users with the optimal experience and not tons of broken links.").await?;
+                    return Ok(());
+                }
+
+                if got_invite.temporary {
+                    ctx.say("Invite code must not be temporary. 
+                    
+    This is required to provide our users with the optimal experience and not tons of broken links.").await?;
+                    return Ok(());
+                }
+
+                sqlx::query!(
+                    "UPDATE servers SET invite_url = $1 WHERE guild_id = $2",
+                    got_invite.code,
+                    guild.id.0 as i64
+                )
+                .execute(&data.pool)
+                .await?;
             }
-
-            if got_invite.is_none() {
-                ctx.say("Invite code could not be found on this guild").await?;
-                return Ok(());
-            }
-
-            let got_invite = got_invite.unwrap();
-
-            if got_invite.max_age != 0 {
-                ctx.say("Invite code must be permanent/unlimited time. 
-                
-This is required to provide our users with the optimal experience and not tons of broken links.").await?;
-                return Ok(());
-            }
-
-            if got_invite.max_uses != 0 {
-                ctx.say("Invite code must be unlimited use. 
-                
-This is required to provide our users with the optimal experience and not tons of broken links.").await?;
-                return Ok(());
-            }
-
-            if got_invite.temporary {
-                ctx.say("Invite code must not be temporary. 
-                
-This is required to provide our users with the optimal experience and not tons of broken links.").await?;
-                return Ok(());
-            }
-
-            sqlx::query!(
-                "UPDATE servers SET invite_url = $1 WHERE guild_id = $2",
-                got_invite.code,
-                guild.id.0 as i64
-            )
-            .execute(&data.pool)
-            .await?;
         },
         SetField::InviteChannelID => {
             // Check for CREATE_INVITES
@@ -936,7 +982,7 @@ This is required to provide our users with the optimal experience and not tons o
             .await?;            
         },
         SetField::Website => {
-            if !value.starts_with("https://") && value != "".to_string() {
+            if !value.starts_with("https://") && value != *"" {
                 ctx.say("Website must start with https://").await?;
                 return Ok(());
             }
@@ -1000,13 +1046,131 @@ This is required to provide our users with the optimal experience and not tons o
             .execute(&data.pool)
             .await?;
         },
+        SetField::Vanity => {
+            let check = sqlx::query!(
+                "SELECT type, redirect FROM vanity WHERE lower(vanity_url) = $1",
+                value.to_lowercase()
+            )
+            .fetch_one(&data.pool)
+            .await;
+
+            match check {
+                Err(sqlx::Error::RowNotFound) => {
+                    sqlx::query!("INSERT INTO vanity (type, vanity_url, redirect) VALUES ($1, $2, $3)", 
+                    0, 
+                    value,
+                    ctx.guild().unwrap().id.0 as i64
+                )
+                    .execute(&data.pool)
+                    .await?;
+                },
+                Err(e) => {
+                    return Err(Box::new(e));
+                },
+                Ok(row) => {
+                    ctx.say(format!("Vanity URL is already in use by `{:?}` of ID `{:?}`", row.r#type, row.redirect)).await?;
+                    return Ok(());
+                },
+            }
+        },
+        SetField::WebhookURL => {
+            if !value.starts_with("https://") && value != *"" {
+                ctx.say("Webhook URL must start with https://").await?;
+                return Ok(());
+            }
+
+            sqlx::query!(
+                "UPDATE servers SET webhook = $1 WHERE guild_id = $2",
+                value,
+                ctx.guild().unwrap().id.0 as i64
+            )
+            .execute(&data.pool)
+            .await?;
+        },
+        SetField::WebhookSecret => {
+            sqlx::query!(
+                "UPDATE servers SET webhook_secret = $1 WHERE guild_id = $2",
+                value,
+                ctx.guild().unwrap().id.0 as i64
+            )
+            .execute(&data.pool)
+            .await?;
+
+            // Remove value for audit logs
+            value = "redacted for security reasons".to_string();
+
+            // Prevent others from seeing interaction
+            ctx.defer_ephemeral().await?;
+        },
+        SetField::WebhookHMACOnly => {
+            let webhook_hmac_only = match value.as_str() {
+                "true" | "0" => true,
+                "false" | "1" => false,
+                _ => {
+                    ctx.say("webhook_hmac_only must be either `false` (`0`) or `true` (`1`)").await?;
+                    return Ok(());
+                }
+            };
+
+            sqlx::query!(
+                "UPDATE servers SET webhook_hmac_only = $1 WHERE guild_id = $2",
+                webhook_hmac_only,
+                ctx.guild().unwrap().id.0 as i64
+            )
+            .execute(&data.pool)
+            .await?;
+        },
+        SetField::RequiresLogin => {
+            let requires_login = match value.as_str() {
+                "true" | "0" => true,
+                "false" | "1" => false,
+                _ => {
+                    ctx.say("requires_login must be either `false` (`0`) or `true` (`1`)").await?;
+                    return Ok(());
+                }
+            };
+
+            sqlx::query!(
+                "UPDATE servers SET login_required = $1 WHERE guild_id = $2",
+                requires_login,
+                ctx.guild().unwrap().id.0 as i64
+            )
+            .execute(&data.pool)
+            .await?;
+        },
+        SetField::VoteRoles => {
+            let mut vote_roles = Vec::new();
+            value = value.replace(',', "|");
+            for role_id in value.split('|') {
+                let role_id = role_id.trim();
+                if role_id.is_empty() {
+                    continue;
+                }
+
+                let role_id = role_id.parse::<i64>()?;
+
+                let role = guild.roles.get(&serenity::RoleId(role_id as u64));
+                if let Some(role) = role {
+                    vote_roles.push(role.id.0 as i64);
+                } else {
+                    ctx.say(format!("Ignoring role: {:?} as it could not be found", role_id)).await?;
+                }
+            }
+
+            sqlx::query!(
+                "UPDATE servers SET autorole_votes = $1 WHERE guild_id = $2",
+                &vote_roles,
+                ctx.guild().unwrap().id.0 as i64
+            )
+            .execute(&data.pool)
+            .await?;
+        },
         _ => {
             ctx.say("This command is being revamped right now and this option is not currently available!").await?;
         }
     }
 
     // Audit log entry
-
     sqlx::query!(
         "INSERT INTO server_audit_logs (guild_id, user_id, username, user_guild_perms, field, value) VALUES ($1, $2, $3, $4, $5, $6)",
         guild.id.0 as i64,
