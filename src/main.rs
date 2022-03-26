@@ -735,8 +735,8 @@ enum SetField {
     #[name = "Webhook HMAC Only"] WebhookHMACOnly,
     #[name = "Requires Login To Join"] RequiresLogin, 
     #[name = "Vote Roles"] VoteRoles, 
-    #[name = "Whitelist Only"] WhitelistOnly, // Done till here
-    #[name = "Whitelist Form"] WhitelistForm,
+    #[name = "Whitelist Only"] WhitelistOnly, 
+    #[name = "Whitelist Form"] WhitelistForm, // Done till here
 }
 
 #[derive(Eq, Serialize_repr, Deserialize_repr, PartialEq, Clone, Copy, Default)]
@@ -790,15 +790,17 @@ async fn set(
 
     // Update server details
     sqlx::query!(
-        "INSERT INTO servers (guild_id, owner_id, name_cached, avatar_cached, api_token, guild_count) VALUES ($1, $2, $3, $4, $5, $6) 
+        "INSERT INTO servers (guild_id, owner_id, name_cached, avatar_cached, api_token, guild_count, nsfw) VALUES ($1, $2, $3, $4, $5, $6, $7) 
         ON CONFLICT (guild_id) DO UPDATE SET owner_id = excluded.owner_id, name_cached = excluded.name_cached, 
-        avatar_cached = excluded.avatar_cached, guild_count = excluded.guild_count WHERE servers.guild_id = $1",
+        avatar_cached = excluded.avatar_cached, guild_count = excluded.guild_count, nsfw = excluded.nsfw WHERE 
+        servers.guild_id = $1",
         guild.id.0 as i64,
         ctx.author().id.0 as i64,
         guild.name.to_string(),
         guild.icon_url().unwrap_or_else(|| "https://api.fateslist.xyz/static/botlisticon.webp".to_string()),
         create_token(128),
-        guild.member_count as i64
+        guild.member_count as i64,
+        guild.nsfw_level == serenity::NsfwLevel::Explicit || guild.nsfw_level == serenity::NsfwLevel::AgeRestricted
     )
     .execute(&data.pool)
     .await?;
