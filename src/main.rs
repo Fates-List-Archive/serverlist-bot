@@ -1525,7 +1525,26 @@ async fn vote_reminder_task(pool: sqlx::PgPool, key_data: KeyData, http: Arc<ser
                     mod_front = ", ";
                 }
 
-                servers_str += format!("the server {mod_front} {server}", server = server, mod_front = mod_front).as_str();
+                if tlen == tlen_initial {
+                    // At first bot, do nothing with mod_front
+                    mod_front = "";
+                }
+
+                let server_row = sqlx::query!(
+                    "SELECT name_cached FROM servers WHERE guild_id = $1",
+                    server
+                )
+                .fetch_one(&pool)
+                .await;
+
+                if server_row.is_err() {
+                    error!("{}", server_row.err().unwrap());
+                    continue; 
+                }
+
+                let server_row = server_row.unwrap();
+
+                servers_str += format!("{mod_front}{server_name} ({server})", server_name = server_row.name_cached, server = server, mod_front = mod_front).as_str();
 
                 tlen -= 1;
             }
