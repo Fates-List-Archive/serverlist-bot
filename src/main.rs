@@ -18,6 +18,9 @@ use serde_repr::Serialize_repr;
 use std::borrow::Cow;
 use rand::{thread_rng, Rng};
 use rand::distributions::Alphanumeric;
+use bigdecimal::BigDecimal;
+use bigdecimal::FromPrimitive;
+use bigdecimal::ToPrimitive;
 
 mod helpers;
 
@@ -142,6 +145,48 @@ async fn autocomplete_vr(
     }
 
     choices
+}
+
+/// Deletes the server. Bot will then leave server upon doing this
+#[poise::command(
+    prefix_command, 
+    track_edits, 
+    slash_command,
+    guild_cooldown = 10, required_permissions = "ADMINISTRATOR"
+)]
+async fn delserver(
+    ctx: Context<'_>,
+)  -> Result<(), Error> {
+    let guild = ctx.guild();
+
+    let data = ctx.data();
+
+    if guild.is_none() {
+        ctx.say("You must be in a server to use this command").await?;
+        return Ok(());
+    }
+
+    let guild = guild.unwrap();
+
+    sqlx::query!(
+        "DELETE FROM servers WHERE guild_id = $1",
+        guild.id.0 as i64
+    )
+    .execute(&data.pool)
+    .await?;
+
+    sqlx::query!(
+        "DELETE FROM vanity WHERE redirect = $1",
+        guild.id.0 as i64
+    )
+    .execute(&data.pool)
+    .await?;
+
+    ctx.say("Server deleted. Am now leaving server on user request. Reinvite bot to readd server to server listing").await?;
+
+    guild.leave(&ctx.discord()).await?;
+
+    Ok(())
 }
 
 /// Disable vote reminders for a bot
@@ -1490,14 +1535,25 @@ async fn vote_reminder_task(pool: sqlx::PgPool, key_data: KeyData, http: Arc<ser
 
         for row in rows {
             // If a user can't vote for one bot, they can't vote for any
-            let count = sqlx::query!(
-                "SELECT COUNT(1) FROM user_server_vote_table WHERE user_id = $1",
+            let voted = sqlx::query!(
+                "SELECT extract(epoch from expires_on) AS expiry FROM user_server_vote_table WHERE user_id = $1",
                 row.user_id
             )
             .fetch_one(&pool)
             .await;
 
-            if count.is_err() || count.unwrap().count.unwrap_or_default() > 0 {
+            let expiry = match voted {
+                Ok(voted) => {
+                    voted.expiry.unwrap_or_default()
+                },
+                Err(_) => {
+                    BigDecimal::from_u64(0).unwrap_or_default()
+                }
+            }.to_u64().unwrap_or_default();
+
+            let now = chrono::Utc::now().timestamp() as u64;
+
+            if expiry > now {
                 continue
             }
 
@@ -1658,7 +1714,8 @@ async fn main() {
                         tag_dump()
                     ],
                     ..tags()
-                }
+                },
+                delserver()
             ],
             ..poise::FrameworkOptions::default()
         })

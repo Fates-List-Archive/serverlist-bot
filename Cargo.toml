@@ -16,6 +16,8 @@ reqwest = { version = "0.11.9", features = ["json"] }
 serde_repr = "0.1.7"
 rand = "0.8.5"
 thiserror = "1.0"
+chrono = { version = "0.4.19", features = ["serde"]}
+bigdecimal = { version = "0.2.2", features = ["serde"] }
 
 [dependencies.tokio]
 version = "1"
